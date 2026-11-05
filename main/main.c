@@ -23,7 +23,14 @@ static const char *TAG = "clock";
 #define CX       (SCREEN_W / 2)
 #define CY       (SCREEN_W / 2)
 
+/* ---------- 屏电源状态（menu.inc 里也要读，先声明） ---------- */
+static bool scr_on = true;
+static int scr_brightness = 100;
+static uint32_t scr_last_activity, scr_last_tap;
+static bool scr_prev_pressed;
+
 #include "face.inc"
+#include "menu.inc"
 #if 0
 static lv_obj_t *hand_hour, *hand_min, *hand_sec;
 static lv_obj_t *lbl_time, *lbl_sec, *lbl_date;
@@ -101,6 +108,70 @@ static void update_clock(lv_timer_t *t)
 }
 
 #endif
+
+/* ---------- 屏电源：双击亮屏 / 30s 无触摸息屏 ---------- */
+#define SCREEN_IDLE_MS    30000
+#define SCREEN_DOUBLE_MS  400
+
+/* 只改背光，不关面板：触摸链路必须一直活着才能收唤醒手势。 */
+static void screen_apply(bool on)
+{
+    if (on == scr_on) return;
+    if (!on) {
+        scr_brightness = bsp_display_brightness_get();
+        if (scr_brightness <= 0) scr_brightness = 100;
+    }
+    esp_err_t err = bsp_display_brightness_set(on ? scr_brightness : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "brightness set failed: %s", esp_err_to_name(err));
+        return;
+    }
+    scr_on = on;
+    scr_last_tap = 0;
+    ESP_LOGI(TAG, "screen %s", on ? "on" : "off");
+}
+
+static bool any_touch_pressed(void)
+{
+    for (lv_indev_t *i = lv_indev_get_next(NULL); i; i = lv_indev_get_next(i)) {
+        if (lv_indev_get_state(i) == LV_INDEV_STATE_PRESSED) return true;
+    }
+    return false;
+}
+
+/* 跑在 LVGL 任务里，调用时已持锁。 */
+static void screen_tick(lv_timer_t *t)
+{
+    (void)t;
+    uint32_t now = lv_tick_get();
+    bool pressed = any_touch_pressed();
+
+    if (pressed) scr_last_activity = now;
+
+    if (pressed && !scr_prev_pressed && !scr_on) {
+        if (scr_last_tap && now - scr_last_tap <= SCREEN_DOUBLE_MS) {
+            screen_apply(true);
+            scr_last_activity = now;
+        } else {
+            scr_last_tap = now;
+        }
+    }
+    scr_prev_pressed = pressed;
+
+    if (scr_on && now - scr_last_activity > SCREEN_IDLE_MS) {
+        screen_apply(false);
+    }
+}
+
+static void screen_start(void)
+{
+    scr_on = true;
+    scr_brightness = 100;
+    scr_last_activity = lv_tick_get();
+    scr_last_tap = 0;
+    scr_prev_pressed = false;
+    lv_timer_create(screen_tick, 30, NULL);
+}
 
 /* ---------- WiFi + SNTP ---------- */
 #define WIFI_SSID "CMCC-KkHC"
@@ -213,20 +284,16 @@ static esp_err_t pmu_write(uint8_t reg, uint8_t value)
 static void power_key_task(void *arg)
 {
     (void)arg;
-    bool screen_on = true;
-    int saved_brightness = 100;
     for (;;) {
         uint8_t status;
         if (pmu_read(0x49, &status) == ESP_OK && (status & 0x08)) {
             /* 写一清除；清除成功才切换，避免一次按键重复触发。 */
             if (pmu_write(0x49, 0x08) == ESP_OK) {
                 bsp_display_lock(-1);
-                if (screen_on) saved_brightness = bsp_display_brightness_get();
-                esp_err_t err = bsp_display_brightness_set(screen_on ? 0 : saved_brightness);
-                if (err == ESP_OK) screen_on = !screen_on;
+                screen_apply(!scr_on);
+                scr_last_activity = lv_tick_get();
                 bsp_display_unlock();
-                ESP_LOGI(TAG, "power short press: screen %s (%s)",
-                         screen_on ? "on" : "off", esp_err_to_name(err));
+                ESP_LOGI(TAG, "power short press: screen %s", scr_on ? "on" : "off");
             }
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -272,7 +339,7 @@ void app_main(void)
     // LVGL 任务已在跑，所有 UI 操作必须持锁
     bsp_display_lock(-1);
     lv_obj_t *scr = lv_screen_active();
-    build_face(scr);
+    build_shell(scr);
 #if 0
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -315,6 +382,9 @@ void app_main(void)
 #endif
     bsp_display_unlock();
     ESP_LOGI(TAG, "clock started");
+    bsp_display_lock(-1);
+    screen_start();
+    bsp_display_unlock();
     power_key_start();
 
     // 屏幕初始化占住了内部 DMA 内存，WiFi 放后面启才不抢它的 SPI 缓冲
