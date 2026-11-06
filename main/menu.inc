@@ -146,6 +146,7 @@ static void menu_touch(lv_event_t *e)
             row_scale[active_row].target=256;
             if(!moved && code==LV_EVENT_RELEASED) {
                 if(active_row==0) page_motion.target=0;
+                else if(active_row==2) music_enter();
                 else row_scale[active_row].v=650;
             }
         }

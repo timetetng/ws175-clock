@@ -30,6 +30,7 @@ static uint32_t scr_last_activity, scr_last_tap;
 static bool scr_prev_pressed;
 
 #include "face.inc"
+#include "music.inc"
 #include "menu.inc"
 #if 0
 static lv_obj_t *hand_hour, *hand_min, *hand_sec;
@@ -158,7 +159,7 @@ static void screen_tick(lv_timer_t *t)
     }
     scr_prev_pressed = pressed;
 
-    if (scr_on && now - scr_last_activity > SCREEN_IDLE_MS) {
+    if (scr_on && !music_active() && now - scr_last_activity > SCREEN_IDLE_MS) {
         screen_apply(false);
     }
 }
@@ -234,7 +235,11 @@ static void wifi_start(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&ic));
+    err = esp_wifi_init(&ic);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi unavailable: %s; clock remains usable", esp_err_to_name(err));
+        return;
+    }
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                         wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
@@ -253,6 +258,10 @@ static void wifi_start(void)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "wifi connecting to %s", WIFI_SSID);
 }
+
+#ifdef MUSIC_SELFTEST
+#include "../tests/music_device.inc"
+#endif
 
 static void seed_time_if_needed(void)
 {
@@ -389,4 +398,7 @@ void app_main(void)
 
     // 屏幕初始化占住了内部 DMA 内存，WiFi 放后面启才不抢它的 SPI 缓冲
     wifi_start();
+#ifdef MUSIC_SELFTEST
+    music_device_test();
+#endif
 }

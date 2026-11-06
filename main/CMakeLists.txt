@@ -6,6 +6,11 @@ idf_component_register(
     INCLUDE_DIRS .)
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE BUILD_EPOCH=${BUILD_EPOCH}LL)
+if(MUSIC_SELFTEST)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE MUSIC_SELFTEST=1)
+endif()
+
+spiffs_create_partition_image(storage ../spiffs FLASH_IN_PROJECT)
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-format)
 
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)
