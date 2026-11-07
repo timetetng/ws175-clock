@@ -1,0 +1,21 @@
+Source page: https://milkyfrog.com/
+Idle artwork: https://static.milkyfrog.com/assets/mf-poster-a73129b5.jpg
+Animation: https://static.milkyfrog.com/assets/mf-stream-90303387e2.mp4
+Retrieved: 2026-11-07
+
+The website serves a 720x1122 H.264/AAC video, 17.514 seconds.
+A fixed crop of 600x840 at (48,254) removes white margins for all frames and the poster.
+The same crop throughout avoids artificial zooming during the animation.
+frog-laugh.gif: full animation, 280x392, 12 fps, 210 frames, 17.50 seconds.
+64-color global palette; Bayer dithering (scale 3); no loop extension.
+Frame rectangle offsets enabled; transparent delta pixels disabled for LVGL's decoder.
+frog-idle.rgb565: poster with the same crop/resize, little-endian RGB565, 219520 bytes.
+Voice: https://b23.tv/dVtb3rt (BV1ZzdHBhEkp, part 1), retrieved 2026-11-07.
+frog-voice.wav: source interval [7.700, 25.200), exactly 17.500 seconds,
+22050 Hz mono PCM16. Extracted with yt-dlp and ffmpeg, no gain normalization.
+Embedded in the app image; music and frog share one audio worker and volume.
+Firmware performs no runtime downloads.
+
+Artwork belongs to its respective rights holders. No redistribution license was
+established from the source page; these source notes do not grant a license.
+Do not assume the project's code license covers the artwork.

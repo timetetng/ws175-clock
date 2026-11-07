@@ -1,8 +1,10 @@
 /* lilt 风格弹簧手势演示；LVGL 回调运行在持锁的 UI 任务内。 */
 #include "motion.h"
 #include "esp_heap_caps.h"
-static lv_obj_t *clock_page, *menu_page, *menu_rows[5];
-static motion_t page_motion, list_motion, row_scale[5];
+#define MENU_ROW_COUNT 5
+#define MENU_SCROLL_MIN (392 - (118 + (MENU_ROW_COUNT - 1) * 78 + 64))
+static lv_obj_t *clock_page, *menu_page, *menu_rows[MENU_ROW_COUNT];
+static motion_t page_motion, list_motion, row_scale[MENU_ROW_COUNT];
 static bool touch_down, moved, from_clock;
 static lv_point_t touch_origin, touch_last;
 static float origin_page, origin_list, finger_velocity;
@@ -87,7 +89,7 @@ static void menu_frame(lv_timer_t *t)
     }
     lv_obj_set_y(clock_page,(int)-page_motion.x);
     lv_obj_set_y(menu_page,466-(int)page_motion.x);
-    for(int i=0;i<5;i++) {
+    for(int i=0;i<MENU_ROW_COUNT;i++) {
         motion_step(&row_scale[i],dt,.25f,.45f);
         lv_obj_set_y(menu_rows[i],118+i*78+(int)list_motion.x);
         lv_obj_set_style_transform_scale(menu_rows[i],(int)row_scale[i].x,0);
@@ -111,7 +113,7 @@ static void menu_touch(lv_event_t *e)
         from_clock=page_motion.target<233;
         finger_velocity=0;
         active_row=-1;
-        if(!from_clock) for(int i=0;i<5;i++) {
+        if(!from_clock) for(int i=0;i<MENU_ROW_COUNT;i++) {
             if(lv_event_get_target(e)==menu_rows[i]) {active_row=i; row_scale[i].target=242;}
         }
     } else if(code==LV_EVENT_PRESSING && touch_down) {
@@ -131,7 +133,7 @@ static void menu_touch(lv_event_t *e)
         } else {
             float x=origin_list+dy;
             if(x>0) x=motion_rubber(x,260);
-            if(x< -180) x=-180-motion_rubber(-180-x,260);
+            if(x< MENU_SCROLL_MIN) x=MENU_SCROLL_MIN-motion_rubber(MENU_SCROLL_MIN-x,260);
             list_motion.x=x; list_motion.v=finger_velocity;
         }
     } else if((code==LV_EVENT_RELEASED || code==LV_EVENT_PRESS_LOST) && touch_down) {
@@ -140,14 +142,16 @@ static void menu_touch(lv_event_t *e)
             page_motion.target=page_motion.x-finger_velocity*.16f>233 ? 466:0;
         } else if(moved) {
             float target=list_motion.x+finger_velocity*.12f;
-            list_motion.target=fminf(0,fmaxf(-180,target));
+            list_motion.target=fminf(0,fmaxf(MENU_SCROLL_MIN,target));
         }
         if(active_row>=0) {
             row_scale[active_row].target=256;
             if(!moved && code==LV_EVENT_RELEASED) {
                 if(active_row==0) page_motion.target=0;
-                else if(active_row==2) music_enter();
-                else row_scale[active_row].v=650;
+                else if(active_row==1) music_enter();
+                else if(active_row==2) frog_enter();
+                else if(active_row==3) settings_enter();
+                else if(active_row==4) terminal_enter();
             }
         }
         active_row=-1;
@@ -192,8 +196,8 @@ static void build_shell(lv_obj_t *scr)
     lv_obj_set_style_text_font(title,&lv_font_montserrat_18,0);
     lv_obj_set_style_text_color(title,lv_color_hex(0xB1C99B),0);
     lv_obj_align(title,LV_ALIGN_TOP_MID,0,65);
-    const char *names[]={"Clock  /  return","Spring  /  tap","Music  /  demo","Timer  /  demo","Settings  /  demo"};
-    for(int i=0;i<5;i++) {
+    const char *names[]={"Clock  /  return","Music  /  demo","Milky Frog  /  tap","Settings  /  device","Shell  /  toy"};
+    for(int i=0;i<MENU_ROW_COUNT;i++) {
         lv_obj_t *row=menu_rows[i]=lv_obj_create(menu_page);
         lv_obj_remove_style_all(row);
         lv_obj_set_size(row,300,64);

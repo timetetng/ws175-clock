@@ -14,13 +14,26 @@ static const char *MUSIC_TAG = "music";
 static const struct {
     const char *path, *title, *artist;
     const lv_image_dsc_t *cover;
-} mu_track = { "/spiffs/demo60.wav", "RAIN LOVE", "Si Feng version", NULL };
+} mu_tracks[] = {
+    { "/spiffs/demo60.wav", "RAIN LOVE", "Si Feng version", NULL },
+    { "/spiffs/gondboy.wav", "GONDBOY", "Old priest", NULL },
+};
+static unsigned mu_track_index;
+#define mu_track mu_tracks[mu_track_index]
+static lv_obj_t *mu_title;
+static atomic_int mu_source_request = -1, sfx_requested = -1;
+static atomic_bool mu_session_closed = true, sfx_playing;
+static atomic_uint mu_total_bytes, mu_sample_rate = 22050;
 typedef enum { MU_LOADING, MU_PAUSED, MU_PLAYING, MU_FINISHED, MU_ERROR } mu_state_t;
 static lv_obj_t *music_page, *mu_time, *mu_status, *mu_info, *mu_button_text, *mu_bar, *mu_artist;
 static atomic_int mu_state;
-static atomic_int mu_volume = 30, mu_applied_volume = -1;
+static atomic_int mu_applied_volume = -1;
 static lv_obj_t *mu_volume_slider, *mu_volume_text;
-static atomic_bool mu_running, mu_exit, mu_play;
+static atomic_bool mu_running, mu_exit, mu_play, mu_rewind;
+/* Published before starting the sole audio worker; immutable until it exits. */
+/* Audio sources are opened only by the single persistent worker. */
+extern const uint8_t frog_voice_start[] asm("_binary_frog_voice_wav_start");
+extern const uint8_t frog_voice_end[] asm("_binary_frog_voice_wav_end");
 static atomic_uint mu_sent;
 /* Published before state changes to PAUSED/ERROR; not changed during a session. */
 static music_wav_t mu_wav;
@@ -34,7 +47,7 @@ static unsigned mu_dma_free(void)
 static void music_task(void *arg)
 {
     (void)arg;
-    FILE *f = NULL;
+    FILE *f = NULL, *effect = NULL;
     uint8_t *buf = NULL;
     i2s_chan_handle_t tx = NULL;
     const audio_codec_data_if_t *data = NULL;
@@ -42,22 +55,21 @@ static void music_task(void *arg)
     const audio_codec_gpio_if_t *gpio = NULL;
     const audio_codec_if_t *codec = NULL;
     esp_codec_dev_handle_t spk = NULL;
-    bool mounted = false;
     const char *error = NULL;
+    bool mounted = false;
     unsigned before = mu_dma_free();
+    music_wav_t effect_wav = {0};
+    uint32_t effect_left = 0;
 #define MU_CHECK(test, message) do { if (!(test)) { error = (message); goto cleanup; } } while (0)
     esp_vfs_spiffs_conf_t conf = {
-        .base_path = "/spiffs", .partition_label = "storage", .max_files = 1,
-        .format_if_mount_failed = false, /* Never erase user data on mount errors. */
+        .base_path = "/spiffs", .partition_label = "storage", .max_files = 3,
+        .format_if_mount_failed = false,
     };
     MU_CHECK(esp_vfs_spiffs_register(&conf) == ESP_OK, "SPIFFS mount failed");
     mounted = true;
-    f = fopen(mu_track.path, "rb");
-    MU_CHECK(f, "Missing demo60.wav");
-    error = music_wav_read(f, &mu_wav);
-    if (error) goto cleanup;
+    mu_wav.rate = 22050;
     /* This buffer is copied into DMA by i2s_channel_write; it needn't live in SRAM. */
-    buf = heap_caps_malloc(MUSIC_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    buf = heap_caps_malloc(MUSIC_CHUNK * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     MU_CHECK(buf, "Audio buffer unavailable");
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(CONFIG_BSP_I2S_NUM, I2S_ROLE_MASTER);
     chan.auto_clear = true;
@@ -102,60 +114,129 @@ static void music_task(void *arg)
     atomic_store(&mu_state, MU_PAUSED);
     ESP_LOGI(MUSIC_TAG, "ready MUTED: %lu Hz, %lu bytes, DMA %u -> %u",
              (unsigned long)mu_wav.rate, (unsigned long)mu_wav.bytes, before, mu_dma_free());
-    bool playing = false;
-    while (!atomic_load(&mu_exit)) {
-        volume = atomic_load(&mu_volume);
+    bool audible = false;
+    for (;;) {
+        int source = atomic_exchange(&mu_source_request, -1);
+        if (source >= 0) {
+            if (f) { fclose(f); f = NULL; }
+            atomic_store(&mu_state, MU_LOADING);
+            atomic_store(&mu_sent, 0);
+            atomic_store(&mu_total_bytes, 0);
+            if (source == 2)
+                f = fmemopen((void *)frog_voice_start, frog_voice_end - frog_voice_start, "rb");
+            else if (source < 2)
+                f = fopen(mu_tracks[source].path, "rb");
+            const char *problem = f ? music_wav_read(f, &mu_wav) : "Audio file unavailable";
+            if (!problem && mu_wav.rate != 22050) problem = "Expected 22050 Hz mono WAV";
+            if (problem) {
+                if (f) { fclose(f); f = NULL; }
+                snprintf(mu_error, sizeof(mu_error), "%s", problem);
+                atomic_store(&mu_state, MU_ERROR);
+                ESP_LOGE(MUSIC_TAG, "%s", problem);
+            } else {
+                atomic_store(&mu_total_bytes, mu_wav.bytes);
+                atomic_store(&mu_sample_rate, mu_wav.rate);
+                atomic_store(&mu_state, MU_PAUSED);
+            }
+        }
+        if (atomic_load(&mu_exit)) {
+            if (f) { fclose(f); f = NULL; }
+            atomic_store(&mu_play, false);
+            atomic_store(&mu_session_closed, true);
+        }
+        if (atomic_exchange(&mu_rewind, false) && f) {
+            MU_CHECK(fseek(f, mu_wav.offset, SEEK_SET) == 0, "Reset seek failed");
+            atomic_store(&mu_sent, 0);
+            atomic_store(&mu_state, MU_PAUSED);
+        }
+        int request = atomic_exchange(&sfx_requested, -1);
+        if (request >= 0 && request < 8 && !effect) {
+            char name[32];
+            snprintf(name, sizeof(name), "/spiffs/sfx%d.wav", request);
+            effect = fopen(name, "rb");
+            const char *problem = effect ? music_wav_read(effect, &effect_wav) : "Missing effect";
+            if (problem || effect_wav.rate != 22050) {
+                if (effect) fclose(effect);
+                effect = NULL;
+                atomic_store(&sfx_playing, false);
+                ESP_LOGW("shake", "Effect unavailable");
+            } else {
+                effect_left = effect_wav.bytes;
+                atomic_store(&sfx_playing, true);
+                ESP_LOGI("shake", "Playing effect %d once", request);
+            }
+        }
+        int volume = atomic_load(&mu_volume);
         if (volume != atomic_load(&mu_applied_volume)) {
             MU_CHECK(esp_codec_dev_set_out_vol(spk, volume) == ESP_CODEC_DEV_OK, "Volume change failed");
-#ifndef MUSIC_SELFTEST
-            /* Zero is real mute; changing volume while paused must never unmute. */
-            MU_CHECK(esp_codec_dev_set_out_mute(spk, !playing || volume == 0) == ESP_CODEC_DEV_OK,
-                     "Volume mute failed");
-#endif
             atomic_store(&mu_applied_volume, volume);
-            ESP_LOGI(MUSIC_TAG, "volume=%d", volume);
         }
-        if (!atomic_load(&mu_play)) {
-            if (playing) {
-                MU_CHECK(esp_codec_dev_set_out_mute(spk, true) == ESP_CODEC_DEV_OK, "Pause failed");
-                playing = false;
+        bool base = f && atomic_load(&mu_play) && !atomic_load(&mu_exit);
+        uint32_t sent = atomic_load(&mu_sent);
+        if (base && sent == mu_wav.bytes) {
+            MU_CHECK(fseek(f, mu_wav.offset, SEEK_SET) == 0, "Replay seek failed");
+            atomic_store(&mu_sent, 0);
+            sent = 0;
+        }
+        size_t base_bytes = base ? mu_wav.bytes - sent : 0;
+        if (base_bytes > MUSIC_CHUNK) base_bytes = MUSIC_CHUNK;
+        size_t effect_bytes = effect ? effect_left : 0;
+        if (effect_bytes > MUSIC_CHUNK) effect_bytes = MUSIC_CHUNK;
+        size_t bytes = base_bytes > effect_bytes ? base_bytes : effect_bytes;
+        if (!bytes) {
+            if (f && atomic_load(&mu_state) == MU_PLAYING)
                 atomic_store(&mu_state, MU_PAUSED);
-                ESP_LOGI(MUSIC_TAG, "paused at %u", atomic_load(&mu_sent));
+            if (audible) {
+                vTaskDelay(pdMS_TO_TICKS(30));
+                MU_CHECK(esp_codec_dev_set_out_mute(spk, true) == ESP_CODEC_DEV_OK, "Idle mute failed");
+                audible = false;
             }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        uint32_t sent = atomic_load(&mu_sent);
-        if (sent == mu_wav.bytes) {
-            MU_CHECK(fseek(f, mu_wav.offset, SEEK_SET) == 0, "Replay seek failed");
-            sent = 0;
-            atomic_store(&mu_sent, 0);
-        }
-        if (!playing) {
-#ifdef MUSIC_SELFTEST
-            /* Test firmware can exercise writes, but can never unmute the speaker. */
-            MU_CHECK(esp_codec_dev_set_out_mute(spk, true) == ESP_CODEC_DEV_OK, "Test mute failed");
-#else
-            MU_CHECK(esp_codec_dev_set_out_mute(spk, volume == 0) == ESP_CODEC_DEV_OK, "Unmute failed");
-#endif
-            playing = true;
+        memset(buf, 0, MUSIC_CHUNK * 2);
+        if (base_bytes) {
+            MU_CHECK(fread(buf, 1, base_bytes, f) == base_bytes, "WAV read failed");
             atomic_store(&mu_state, MU_PLAYING);
-            ESP_LOGI(MUSIC_TAG, "playing at %lu", (unsigned long)sent);
+        } else if (f && atomic_load(&mu_state) == MU_PLAYING) {
+            atomic_store(&mu_state, MU_PAUSED);
         }
-        size_t want = mu_wav.bytes - sent;
-        if (want > MUSIC_CHUNK) want = MUSIC_CHUNK;
-        MU_CHECK(fread(buf, 1, want, f) == want, "WAV read failed");
-        MU_CHECK(esp_codec_dev_write(spk, buf, want) == ESP_CODEC_DEV_OK, "I2S write failed");
-        sent += want;
-        atomic_store(&mu_sent, sent);
-        if (sent == mu_wav.bytes) {
-            /* Let the final DMA buffer drain before muting. */
-            vTaskDelay(pdMS_TO_TICKS(30));
-            MU_CHECK(esp_codec_dev_set_out_mute(spk, true) == ESP_CODEC_DEV_OK, "Finish mute failed");
-            playing = false;
-            atomic_store(&mu_play, false);
-            atomic_store(&mu_state, MU_FINISHED);
-            ESP_LOGI(MUSIC_TAG, "finished %lu bytes", (unsigned long)sent);
+        if (effect_bytes) {
+            if (fread(buf + MUSIC_CHUNK, 1, effect_bytes, effect) != effect_bytes) {
+                effect_bytes = 0;
+                effect_left = 0;
+            } else effect_left -= effect_bytes;
+            int16_t *pcm = (int16_t *)buf;
+            const int16_t *fx = (const int16_t *)(buf + MUSIC_CHUNK);
+            for (size_t i = 0; i < bytes / 2; i++) {
+                int a = i < base_bytes / 2 ? pcm[i] : 0;
+                int b = i < effect_bytes / 2 ? fx[i] : 0;
+                /* Leave headroom only while overlaying, retaining both timelines. */
+                int sample = base_bytes && effect_bytes ? a / 2 + b / 2 : a + b;
+                if (sample > 32767) sample = 32767;
+                if (sample < -32768) sample = -32768;
+                pcm[i] = (int16_t)sample;
+            }
+        }
+#if defined(MUSIC_SELFTEST) || defined(FROG_SELFTEST)
+        MU_CHECK(esp_codec_dev_set_out_mute(spk, true) == ESP_CODEC_DEV_OK, "Test mute failed");
+#else
+        MU_CHECK(esp_codec_dev_set_out_mute(spk, volume == 0) == ESP_CODEC_DEV_OK, "Output mute failed");
+#endif
+        audible = true;
+        MU_CHECK(esp_codec_dev_write(spk, buf, bytes) == ESP_CODEC_DEV_OK, "I2S write failed");
+        if (base_bytes) {
+            sent += base_bytes;
+            atomic_store(&mu_sent, sent);
+            if (sent == mu_wav.bytes) {
+                atomic_store(&mu_play, false);
+                atomic_store(&mu_state, MU_FINISHED);
+            }
+        }
+        if (effect && !effect_left) {
+            fclose(effect);
+            effect = NULL;
+            atomic_store(&sfx_playing, false);
         }
     }
 cleanup:
@@ -174,6 +255,7 @@ cleanup:
         i2s_del_channel(tx);
     }
     if (f) fclose(f);
+    if (effect) fclose(effect);
     free(buf);
     if (mounted) esp_vfs_spiffs_unregister("storage");
     if (error) {
@@ -181,11 +263,35 @@ cleanup:
         atomic_store(&mu_state, MU_ERROR);
         ESP_LOGE(MUSIC_TAG, "%s", error);
     }
-    ESP_LOGI(MUSIC_TAG, "released audio; DMA free=%u", mu_dma_free());
-    atomic_store(&mu_play, false);
+    atomic_store(&mu_session_closed, true);
+    atomic_store(&sfx_playing, false);
     atomic_store(&mu_running, false);
     vTaskDelete(NULL);
 #undef MU_CHECK
+}
+
+/* One always-on worker owns the codec; UI sessions and global SFX share it. */
+static void audio_background_start(void)
+{
+    if (atomic_exchange(&mu_running, true)) return;
+    if (xTaskCreate(music_task, "audio", 6144, NULL, 4, NULL) != pdPASS) {
+        snprintf(mu_error, sizeof(mu_error), "Audio task unavailable");
+        atomic_store(&mu_state, MU_ERROR);
+        atomic_store(&mu_running, false);
+        atomic_store(&mu_session_closed, true);
+    }
+}
+
+static void music_session_start(bool memory_source)
+{
+    atomic_store(&mu_exit, false);
+    atomic_store(&mu_play, false);
+    atomic_store(&mu_rewind, false);
+    atomic_store(&mu_sent, 0);
+    atomic_store(&mu_state, MU_LOADING);
+    atomic_store(&mu_session_closed, false);
+    atomic_store(&mu_source_request, memory_source ? 2 : (int)mu_track_index);
+    audio_background_start();
 }
 
 static bool music_active(void)
@@ -200,6 +306,7 @@ static void mu_back_cb(lv_event_t *e)
     if (!scr_on) return;
     atomic_store(&mu_play, false);
     atomic_store(&mu_exit, true);
+    preferences_request_save();
 #endif
 }
 
@@ -217,7 +324,7 @@ static void mu_volume_cb(lv_event_t *e)
 {
     if (!scr_on || atomic_load(&mu_exit)) return;
     int volume = lv_slider_get_value(lv_event_get_target(e));
-    atomic_store(&mu_volume, volume);
+    preferences_volume(volume);
     lv_label_set_text_fmt(mu_volume_text, "%d", volume);
 }
 
@@ -236,7 +343,7 @@ static void music_ui_timer(lv_timer_t *timer)
 {
     if (atomic_load(&mu_exit)) {
         lv_label_set_text(mu_status, "STOPPING...");
-        if (!atomic_load(&mu_running)) {
+        if (atomic_load(&mu_session_closed)) {
             lv_obj_delete(music_page);
             music_page = NULL;
             scr_last_activity = lv_tick_get();
@@ -257,11 +364,13 @@ static void music_ui_timer(lv_timer_t *timer)
         lv_obj_set_width(mu_info, 330);
         lv_label_set_text(mu_info, mu_error);
     } else if (state != MU_LOADING) {
-        uint32_t sent = atomic_load(&mu_sent), bps = mu_wav.rate * 2;
-        uint32_t sec = sent / bps, total = mu_wav.bytes / bps;
+        uint32_t sent = atomic_load(&mu_sent), bps = atomic_load(&mu_sample_rate) * 2;
+        uint32_t total_bytes = atomic_load(&mu_total_bytes);
+        if (!bps || !total_bytes) return;
+        uint32_t sec = sent / bps, total = total_bytes / bps;
         lv_label_set_text_fmt(mu_time, "%lu:%02lu / %lu:%02lu",
             (unsigned long)(sec/60), (unsigned long)(sec%60), (unsigned long)(total/60), (unsigned long)(total%60));
-        lv_bar_set_value(mu_bar, (uint64_t)sent * 1000 / mu_wav.bytes, LV_ANIM_OFF);
+        lv_bar_set_value(mu_bar, (uint64_t)sent * 1000 / total_bytes, LV_ANIM_OFF);
 
     }
 }
@@ -308,6 +417,20 @@ static void mu_build_cover(lv_obj_t *parent)
     lv_obj_center(note);
 }
 
+static void mu_track_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!scr_on || atomic_load(&mu_exit)) return;
+    bool was_playing = atomic_load(&mu_play);
+    mu_track_index = (mu_track_index + 1) % 2;
+    lv_label_set_text(mu_title, mu_track.title);
+    lv_label_set_text(mu_artist, mu_track.artist);
+    lv_obj_remove_flag(mu_artist, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(mu_info, "");
+    music_session_start(false);
+    atomic_store(&mu_play, was_playing);
+}
+
 static lv_obj_t *mu_control(lv_obj_t *parent, const char *symbol, int x, int size, bool primary)
 {
     lv_obj_t *button = lv_button_create(parent);
@@ -325,7 +448,7 @@ static lv_obj_t *mu_control(lv_obj_t *parent, const char *symbol, int x, int siz
         mu_button_text = label;
         lv_obj_add_event_cb(button, mu_play_cb, LV_EVENT_CLICKED, NULL);
     } else {
-        lv_obj_add_state(button, LV_STATE_DISABLED); /* One track: no fake switching. */
+        lv_obj_add_event_cb(button, mu_track_cb, LV_EVENT_CLICKED, NULL);
     }
     return button;
 }
@@ -333,11 +456,7 @@ static lv_obj_t *mu_control(lv_obj_t *parent, const char *symbol, int x, int siz
 /* Called only by LVGL, on the Music row's click; no resources allocated at boot. */
 static void music_enter(void)
 {
-    if (music_page || atomic_load(&mu_running)) return;
-    atomic_store(&mu_exit, false);
-    atomic_store(&mu_play, false);
-    atomic_store(&mu_sent, 0);
-    atomic_store(&mu_state, MU_LOADING);
+    if (music_page) return;
     music_page = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(music_page);
     lv_obj_set_size(music_page, 466, 466);
@@ -355,8 +474,8 @@ static void music_enter(void)
     lv_obj_t *label = mu_label(back, LV_SYMBOL_LEFT, 0, 0xB1C99B);
     lv_obj_center(label);
     mu_build_cover(music_page);
-    lv_obj_t *title = mu_label(music_page, mu_track.title, 256, 0xEEF3E9);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    mu_title = mu_label(music_page, mu_track.title, 256, 0xEEF3E9);
+    lv_obj_set_style_text_font(mu_title, &lv_font_montserrat_24, 0);
     mu_artist = mu_label(music_page, mu_track.artist, 287, 0x8CA18E);
     lv_obj_set_style_text_font(mu_artist, &lv_font_montserrat_14, 0);
     mu_bar = lv_bar_create(music_page);
@@ -410,11 +529,8 @@ static void music_enter(void)
     lv_obj_set_style_bg_opa(mu_volume_slider, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_pad_all(mu_volume_slider, 4, LV_PART_KNOB);
     lv_obj_add_event_cb(mu_volume_slider, mu_volume_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(mu_volume_slider, preferences_release_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(mu_volume_slider, preferences_release_cb, LV_EVENT_PRESS_LOST, NULL);
     lv_timer_create(music_ui_timer, 100, NULL);
-    atomic_store(&mu_running, true);
-    if (xTaskCreate(music_task, "music", 6144, NULL, 4, NULL) != pdPASS) {
-        snprintf(mu_error, sizeof(mu_error), "Audio task unavailable");
-        atomic_store(&mu_state, MU_ERROR);
-        atomic_store(&mu_running, false);
-    }
+    music_session_start(false);
 }

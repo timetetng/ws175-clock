@@ -1,0 +1,42 @@
+[
+  {
+    "file": "sfx0.wav",
+    "source": "冰冰冰.mp3",
+    "weight": 3
+  },
+  {
+    "file": "sfx1.wav",
+    "source": "叹气.mp3",
+    "weight": 3
+  },
+  {
+    "file": "sfx2.wav",
+    "source": "呦齁齁齁.mp3",
+    "weight": 3
+  },
+  {
+    "file": "sfx3.wav",
+    "source": "哇哦.mp3",
+    "weight": 1
+  },
+  {
+    "file": "sfx4.wav",
+    "source": "哇喔.mp3",
+    "weight": 1
+  },
+  {
+    "file": "sfx5.wav",
+    "source": "哇噢.mp3",
+    "weight": 1
+  },
+  {
+    "file": "sfx6.wav",
+    "source": "女主角死亡音效.mp3",
+    "weight": 1
+  },
+  {
+    "file": "sfx7.wav",
+    "source": "奶龙笑.mp3",
+    "weight": 1
+  }
+]

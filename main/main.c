@@ -3,6 +3,9 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+#include <stdatomic.h>
+#include "settings_model.h"
+#include "connectivity.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -25,12 +28,18 @@ static const char *TAG = "clock";
 
 /* ---------- 屏电源状态（menu.inc 里也要读，先声明） ---------- */
 static bool scr_on = true;
-static int scr_brightness = 100;
+static atomic_int scr_brightness = SETTINGS_DEFAULT;
 static uint32_t scr_last_activity, scr_last_tap;
 static bool scr_prev_pressed;
 
+#include "preferences.inc"
 #include "face.inc"
 #include "music.inc"
+#include "shake.inc"
+#include "frog.inc"
+#include "settings.inc"
+#include "wireless.inc"
+#include "terminal.inc"
 #include "menu.inc"
 #if 0
 static lv_obj_t *hand_hour, *hand_min, *hand_sec;
@@ -118,10 +127,6 @@ static void update_clock(lv_timer_t *t)
 static void screen_apply(bool on)
 {
     if (on == scr_on) return;
-    if (!on) {
-        scr_brightness = bsp_display_brightness_get();
-        if (scr_brightness <= 0) scr_brightness = 100;
-    }
     esp_err_t err = bsp_display_brightness_set(on ? scr_brightness : 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "brightness set failed: %s", esp_err_to_name(err));
@@ -159,7 +164,7 @@ static void screen_tick(lv_timer_t *t)
     }
     scr_prev_pressed = pressed;
 
-    if (scr_on && !music_active() && now - scr_last_activity > SCREEN_IDLE_MS) {
+    if (scr_on && !music_active() && !frog_active() && now - scr_last_activity > SCREEN_IDLE_MS) {
         screen_apply(false);
     }
 }
@@ -167,7 +172,6 @@ static void screen_tick(lv_timer_t *t)
 static void screen_start(void)
 {
     scr_on = true;
-    scr_brightness = 100;
     scr_last_activity = lv_tick_get();
     scr_last_tap = 0;
     scr_prev_pressed = false;
@@ -209,58 +213,88 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "wifi disconnected, retry");
-        esp_wifi_connect();
+        bool retry = connectivity_wifi_retry();
+        connectivity_wifi_down();
+        if (retry) {
+            ESP_LOGW(TAG, "wifi disconnected, retry");
+            esp_wifi_connect();
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&e->ip_info.ip));
+        char ip[16];
+        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&e->ip_info.ip));
+        connectivity_wifi_up(ip);
         start_sntp();
     }
 }
 
+static bool wifi_ok(esp_err_t error, const char *stage)
+{
+    if (error == ESP_OK) return true;
+    ESP_LOGE(TAG, "%s: %s; clock remains usable", stage, esp_err_to_name(error));
+    connectivity_wifi_error(stage, error);
+    return false;
+}
+
 static void wifi_start(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+    if (!preferences_storage_ok) {
+        ESP_LOGE(TAG, "WiFi unavailable: NVS not initialized; storage left untouched");
+        connectivity_wifi_error("NVS unavailable / no storage erased", ESP_ERR_INVALID_STATE);
+        return;
     }
-    ESP_ERROR_CHECK(err);
+    esp_err_t err;
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    if (!wifi_ok(esp_netif_init(), "Network init failed")) return;
+    if (!wifi_ok(esp_event_loop_create_default(), "Event loop init failed")) return;
+    if (!esp_netif_create_default_wifi_sta()) {
+        wifi_ok(ESP_ERR_NO_MEM, "Wi-Fi interface allocation failed");
+        return;
+    }
 
     ESP_LOGI(TAG, "DMA before wifi: free=%u largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&ic);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi unavailable: %s; clock remains usable", esp_err_to_name(err));
-        return;
-    }
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                        wifi_event_handler, NULL, NULL));
+    if (!wifi_ok(err, "Wi-Fi init failed")) return;
+    if (!wifi_ok(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                 wifi_event_handler, NULL, NULL), "Wi-Fi event registration failed")) return;
+    if (!wifi_ok(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                 wifi_event_handler, NULL, NULL), "IP event registration failed")) return;
+    if (!wifi_ok(esp_wifi_set_mode(WIFI_MODE_STA), "Wi-Fi mode setup failed")) return;
 
     wifi_config_t wc = {0};
-    strncpy((char *)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid) - 1);
-    strncpy((char *)wc.sta.password, WIFI_PASS, sizeof(wc.sta.password) - 1);
-    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    /* Keep a successful profile selected in Settings across reboots.
+     * Existing project credentials are only the first-boot fallback. */
+    if (esp_wifi_get_config(WIFI_IF_STA, &wc) != ESP_OK || !wc.sta.ssid[0]) {
+        strncpy((char *)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid) - 1);
+        strncpy((char *)wc.sta.password, WIFI_PASS, sizeof(wc.sta.password) - 1);
+        wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    err = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    net_secret_clear(&wc, sizeof(wc));
+    if (!wifi_ok(err, "Wi-Fi configuration failed")) return;
+    if (!wifi_ok(esp_wifi_start(), "Wi-Fi start failed")) return;
     ESP_LOGI(TAG, "DMA after wifi: free=%u largest=%u; display buffer=8 rows",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    ESP_LOGI(TAG, "wifi connecting to %s", WIFI_SSID);
+    ESP_LOGI(TAG, "wifi connecting using saved profile");
 }
 
 #ifdef MUSIC_SELFTEST
 #include "../tests/music_device.inc"
+#endif
+#ifdef FROG_SELFTEST
+#include "../tests/frog_device.inc"
+#endif
+#ifdef SETTINGS_SELFTEST
+#include "../tests/settings_device.inc"
+#endif
+#ifdef TERMINAL_SELFTEST
+#include "../tests/terminal_device.inc"
 #endif
 
 static void seed_time_if_needed(void)
@@ -290,10 +324,22 @@ static esp_err_t pmu_write(uint8_t reg, uint8_t value)
     return i2c_master_transmit(power_pmu, data, sizeof(data), 100);
 }
 
+/* AXP2101 status0/status1/percentage only; never change charger or ADC setup. */
+static void preferences_battery_poll(void)
+{
+    uint8_t status0 = 0, status1 = 0, percent = 255;
+    bool valid = pmu_read(0x00, &status0) == ESP_OK && pmu_read(0x01, &status1) == ESP_OK;
+    if (valid && (status0 & 8)) pmu_read(0xA4, &percent);
+    atomic_store(&preferences_battery, settings_battery(valid, status0, status1, percent));
+}
+
 static void power_key_task(void *arg)
 {
     (void)arg;
+    unsigned battery_poll = 0;
     for (;;) {
+        if (battery_poll++ % 40 == 0) preferences_battery_poll();
+        preferences_save_pending();
         uint8_t status;
         if (pmu_read(0x49, &status) == ESP_OK && (status & 0x08)) {
             /* 写一清除；清除成功才切换，避免一次按键重复触发。 */
@@ -334,6 +380,8 @@ static void power_key_start(void)
 
 void app_main(void)
 {
+    preferences_load();
+    connectivity_init(); /* Publish backend state before the LVGL task starts. */
     setenv("TZ", "CST-8", 1);
     tzset();
     seed_time_if_needed();
@@ -343,7 +391,8 @@ void app_main(void)
         ESP_LOGE(TAG, "bsp_display_start failed");
         return;
     }
-    bsp_display_brightness_set(100);
+    if (bsp_display_brightness_set(atomic_load(&scr_brightness)) != ESP_OK)
+        ESP_LOGE(TAG, "Initial brightness could not be applied");
 
     // LVGL 任务已在跑，所有 UI 操作必须持锁
     bsp_display_lock(-1);
@@ -398,7 +447,18 @@ void app_main(void)
 
     // 屏幕初始化占住了内部 DMA 内存，WiFi 放后面启才不抢它的 SPI 缓冲
     wifi_start();
+    audio_background_start();
+    shake_start();
 #ifdef MUSIC_SELFTEST
     music_device_test();
+#endif
+#ifdef FROG_SELFTEST
+    frog_device_test();
+#endif
+#ifdef SETTINGS_SELFTEST
+    settings_device_test();
+#endif
+#ifdef TERMINAL_SELFTEST
+    terminal_device_test();
 #endif
 }
